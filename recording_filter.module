@@ -1,0 +1,240 @@
+<?php
+
+// File: recording_filter.module
+
+use Drupal\Core\Ajax\AjaxResponse;
+use Drupal\Core\Ajax\ReplaceCommand;
+use Drupal\node\Entity\Node;
+use Drupal\Core\Url;
+use Drupal\Core\Routing\RouteProviderInterface;
+use Drupal\Core\Render\Renderer;
+use Drupal\Core\Ajax\InvokeCommand;
+use Drupal\Core\Form\FormState;
+use Drupal\Core\Ajax\AppendCommand;
+use Drupal\Core\Ajax\AlertCommand;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Render\RendererInterface;
+use Drupal\Core\Controller\ControllerBase;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+
+/**
+ * Implements hook_form_alter().
+ */
+function recording_filter_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if ($form_id == 'node_recording_form' || $form_id == 'node_recording_edit_form') {
+    
+    // Initialize the count for song name references if not already set.
+    if (!$form_state->has('field_song_name_reference_count')) {
+      $form_state->set('field_song_name_reference_count', count($form['field_song_name_reference']['widget']));
+    }
+
+    $form['#attached']['library'][] = 'recording_filter/recording_filter_js';
+    
+    // Set up AJAX callback for when the artist is changed.
+    $form['field_artist_name_reference']['widget']['#ajax'] = [
+      'callback' => 'recording_filter_updateTourAndSongFields',
+      'event' => 'change',
+    ];
+
+    // Wrap the tour field in a div for AJAX targeting
+    $form['field_tour_name_reference']['#prefix'] = '<div id="tour-name-wrapper">';
+    $form['field_tour_name_reference']['#suffix'] = '</div>';
+
+    // Wrap the entire song reference field in a div for AJAX targeting
+    $form['field_song_name_reference']['#prefix'] = '<div id="song-name-wrapper-all">';
+    $form['field_song_name_reference']['#suffix'] = '</div>';
+
+    // Add unique wrappers for each song name reference field to handle the AJAX replacement
+    if (isset($form['field_song_name_reference']['widget'])) {
+      foreach ($form['field_song_name_reference']['widget'] as $delta => &$song_widget) {
+        // Check if this delta is an actual widget element
+        if (is_array($song_widget) && isset($song_widget['target_id'])) {
+          $song_widget['target_id']['#prefix'] = '<div id="song-name-wrapper-' . $delta . '">';
+          $song_widget['target_id']['#suffix'] = '</div>';
+        }
+      }
+    }
+
+    // Ensure that the "Add another item" button has an AJAX callback
+    if (isset($form['field_song_name_reference']['widget']['add_more'])) {
+      $form['field_song_name_reference']['widget']['add_more']['#ajax'] = [
+        'callback' => 'recording_filter_add_another_item_callback',
+        'event' => 'click',
+        'progress' => [
+          'type' => 'throbber',
+          'message' => NULL,
+        ],
+      ];
+    }
+  }
+}
+
+//Add a new autocomplete field and filter by artist
+
+function recording_filter_add_another_item_callback(array &$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  // Logging to verify the function is triggered.
+  \Drupal::logger('recording_filter')->notice('Add another item callback triggered.');
+
+  // Fetch the current number of items already in the field.
+  $current_items = $form_state->getValue('field_song_name_reference');
+  $delta_offset = count($current_items);
+
+  // Get the selected artist ID from the form state.
+  $artist_value = $form_state->getValue('field_artist_name_reference');
+  $artist_id = isset($artist_value[0]['target_id']) ? $artist_value[0]['target_id'] : $artist_value;
+
+  if (empty($artist_id)) {
+    \Drupal::logger('recording_filter')->error('Artist ID is missing or invalid.');
+    return new AjaxResponse(); // Prevent further processing if no artist is selected.
+  }
+
+  // Create a new AjaxResponse.
+  $response = new AjaxResponse();
+
+  // Build a new widget for the song field with default rendering.
+  $autocomplete_path = Url::fromRoute('recording_filter.autocomplete_songs', ['artist_id' => $artist_id])->toString();
+
+  // Create the new row array for the autocomplete input.
+  $new_row = [
+    '#type' => 'textfield', // Use a standard textfield for default rendering
+    '#title' => t('Song Name'),
+    '#attributes' => [
+      'class' => ['form-autocomplete'],
+      'data-autocomplete-path' => $autocomplete_path, // Set your custom path for filtering
+    ],
+    '#ajax' => [
+      'callback' => 'recording_filter_updateTourAndSongFields',
+      'event' => 'change',
+    ],
+    '#prefix' => '<tr id="song-name-wrapper-' . $delta_offset . '">',
+    '#suffix' => '</tr>',
+  ];
+
+  // Add the new row to the form array at the correct position.
+  $form['field_song_name_reference']['widget'][$delta_offset] = $new_row;
+
+  // Render the updated rows of the field.
+  $rendered_rows = \Drupal::service('renderer')->renderRoot($form['field_song_name_reference']['widget']);
+
+  // Use AppendCommand to update only the tbody part of the song names table.
+  $response->addCommand(new AppendCommand('#field-song-name-reference-values tbody', $rendered_rows));
+
+  return $response;
+}
+
+/**
+ * AJAX callback to update Tour and Song fields.
+ */
+function recording_filter_updateTourAndSongFields(array &$form, \Drupal\Core\Form\FormStateInterface $form_state) {
+  \Drupal::logger('recording_filter')->notice('Inside recording_filter_updateTourAndSongFields: Updating tour and song fields.');
+  // Retrieve the artist ID from the form state.
+  $artist_value = $form_state->getValue('field_artist_name_reference');
+
+  if (is_array($artist_value) && isset($artist_value[0]['target_id']) && !empty($artist_value[0]['target_id'])) {
+    $artist_id = $artist_value[0]['target_id'];
+    \Drupal::logger('recording_filter')->notice('Artist ID: @artist_id', ['@artist_id' => $artist_id]);
+
+  // Load the tours and songs related to the selected artist.
+  $tours = recording_filter_get_tours_by_artist($artist_id);
+  $songs = recording_filter_get_songs_by_artist($artist_id);
+
+  // Update the options for the Tour field.
+  $form['field_tour_name_reference']['widget']['#options'] = $tours;
+
+  $response = new AjaxResponse();
+
+    // Update each song reference field separately by targeting their individual wrappers.
+    foreach ($form['field_song_name_reference']['widget'] as $delta => &$song_widget) {
+      if (is_array($song_widget) && isset($song_widget['target_id'])) {
+        // Set the autocomplete route dynamically for each song field.
+        if (empty($artist_id)) {
+          \Drupal::logger('recording_filter')->error('Artist ID is empty');
+        }
+
+        $autocomplete_path = Url::fromRoute('recording_filter.autocomplete_songs', ['artist_id' => $artist_id])->toString();
+        if ($autocomplete_path) {
+          \Drupal::logger('recording_filter')->notice('Generated autocomplete path: @path', ['@path' => $autocomplete_path]);
+        } else {
+          \Drupal::logger('recording_filter')->error('Could not generate autocomplete path for artist ID: @artist_id', ['@artist_id' => $artist_id]);
+        }
+        
+        // Set the autocomplete route dynamically for each song field. 
+        $song_widget['target_id']['#attributes']['data-autocomplete-path'] = $autocomplete_path;
+        
+         // Log the autocomplete path for debugging.
+         \Drupal::logger('recording_filter')->notice('Autocomplete path for song delta @delta: @path', [
+          '@delta' => $delta,
+          '@path' => $autocomplete_path,
+        ]);
+
+        // Inspect the form structure to ensure it's properly updated.
+        \Drupal::logger('recording_filter')->notice('Song widget: @widget', [
+          '@widget' => print_r($song_widget, TRUE),
+        ]);
+
+        // Wrap each field with a unique ID if not already wrapped.
+        if (!isset($song_widget['#prefix']) || strpos($song_widget['#prefix'], 'song-name-wrapper') === FALSE) {
+          $song_widget['#prefix'] = '<div id="song-name-wrapper-' . $delta . '">';
+          $song_widget['#suffix'] = '</div>';
+        }
+
+        // Replace each individual song field by targeting its specific wrapper.
+          $response->addCommand(new ReplaceCommand('#song-name-wrapper-' . $delta, $form['field_song_name_reference']['widget'][$delta]['target_id']));
+      }
+    }
+
+    // Also update the Tour field.
+    $response->addCommand(new ReplaceCommand('#tour-name-wrapper', $form['field_tour_name_reference']));
+
+    return $response;
+  } else {
+    \Drupal::logger('recording_filter')->error('Invalid artist selection or structure.');
+    return new AjaxResponse(); // Return empty response to avoid breaking.
+  }
+}
+
+/**
+ * Helper function to get tours by artist.
+ */
+function recording_filter_get_tours_by_artist($artist_id) {
+  $query = \Drupal::entityQuery('node')
+    ->condition('type', 'tour')
+    ->condition('field_artist_name_reference', $artist_id)
+    ->accessCheck(TRUE);
+  $nids = $query->execute();
+
+  $tours = [];
+  if (!empty($nids)) {
+    $nodes = Node::loadMultiple($nids);
+    foreach ($nodes as $node) {
+      $tours[$node->id()] = $node->label();
+    }
+  }
+
+  \Drupal::logger('recording_filter')->notice('Tours: @tours', ['@tours' => print_r($tours, TRUE)]);
+  return $tours;
+}
+
+/**
+ * Helper function to get songs by artist.
+ */
+function recording_filter_get_songs_by_artist($artist_id) {
+  $query = \Drupal::entityQuery('node')
+    ->condition('type', 'song')
+    ->condition('field_artist_name_reference', $artist_id)
+    ->accessCheck(TRUE);
+  $nids = $query->execute();
+
+  $songs = [];
+  if (!empty($nids)) {
+    $nodes = Node::loadMultiple($nids);
+    foreach ($nodes as $node) {
+      $songs[$node->id()] = $node->label();
+    }
+  }
+
+  \Drupal::logger('recording_filter')->notice('Songs: @songs', ['@songs' => print_r($songs, TRUE)]);
+  return $songs;
+}
+

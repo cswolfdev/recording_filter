@@ -1,0 +1,8 @@
+recording_filter_js:
+  version: 1.x
+  js:
+    js/recording_filter.js: {}
+  dependencies:
+    - core/jquery
+    - core/drupal
+    - core/drupalSettings
